@@ -165,6 +165,12 @@ especially when many keys are used, so if performance is more important than
 accuracy, using `--n-best 0` can be used to disable n-best decoding.  Default:
 at least decode 8 matches.
 
+--skip-block-type-b::
+Prioritize block type A during decoding for improved reliability. This can help
+in situations where specific arbitrary payloads need to be retrieved and block
+type B may be more sensitive to certain conditions or audio processing. Using
+this option may improve detection reliability in challenging cases.
+
 [[key]]
 == Watermark Key
 
