@@ -71,6 +71,7 @@ print_usage()
   printf ("  --detect-speed          detect and correct replay speed difference\n");
   printf ("  --detect-speed-patient  slower, more accurate speed detection\n");
   printf ("  --json <file>           write JSON results into file\n");
+  printf ("  --skip-block-type-b     prioritize block type A during decoding for improved reliability\n");
   printf ("\n");
   printf ("Options for add / get / cmp:\n");
   printf ("  --key <file>            load watermarking key from file\n");
