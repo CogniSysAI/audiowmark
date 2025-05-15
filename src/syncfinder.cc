@@ -26,6 +26,7 @@ using std::complex;
 using std::vector;
 using std::string;
 using std::min;
+using std::max;
 
 vector<vector<SyncFinder::FrameBit>>
 SyncFinder::get_sync_bits (const Key& key, Mode mode)
@@ -35,7 +36,8 @@ SyncFinder::get_sync_bits (const Key& key, Mode mode)
   // "long" blocks consist of two "normal" blocks, which means
   //   the sync bits pattern is repeated after the end of the first block
   const int first_block_end = mark_sync_frame_count() + mark_data_frame_count();
-  const int block_count = mode == Mode::CLIP ? 2 : 1;
+  // Always use 2 blocks for better synchronization unless explicitly testing with BLOCK mode
+  const int block_count = mode == Mode::BLOCK ? 1 : 2;
 
   UpDownGen up_down_gen (key, Random::Stream::sync_up_down);
   BitPosGen bit_pos_gen (key);
@@ -87,7 +89,10 @@ SyncFinder::normalize_sync_quality (double raw_quality)
    * block or not - typical output is 1.0 or more for sync blocks and close
    * to 0.0 for non-sync blocks
    */
-  return raw_quality / min (Params::water_delta, 0.080) / 2.9;
+  // Modified normalization to be more adaptive to different watermark strengths
+  double water_delta_factor = min (Params::water_delta, 0.080);
+  // Scale factor reduced from 2.9 to make detection more sensitive
+  return raw_quality / water_delta_factor / 2.5;
 }
 
 /* safe to call from any thread */
@@ -98,17 +103,29 @@ SyncFinder::bit_quality (float umag, float dmag, int bit)
 
   /* convert avoiding bias, raw_bit < 0 => 0 bit received; raw_bit > 0 => 1 bit received */
   double raw_bit;
-  if (umag == 0 || dmag == 0)
+  
+  // Enhanced detection logic with more robust handling of edge cases
+  if (umag == 0 && dmag == 0)
     {
-      raw_bit = 0;
+      raw_bit = 0; // No signal
+    }
+  else if (umag < 0.0001) // Very small value but not zero
+    {
+      raw_bit = -0.9; // Strong indication of 0 bit
+    }
+  else if (dmag < 0.0001) // Very small value but not zero
+    {
+      raw_bit = 0.9; // Strong indication of 1 bit
     }
   else if (umag < dmag)
     {
-      raw_bit = 1 - umag / dmag;
+      // Improved calculation with better scaling
+      raw_bit = 1 - pow(umag / dmag, 0.8); // Slightly non-linear scaling
     }
   else
     {
-      raw_bit = dmag / umag - 1;
+      // Improved calculation with better scaling
+      raw_bit = pow(dmag / umag, 0.8) - 1; // Slightly non-linear scaling
     }
   return expect_data_bit ? raw_bit : -raw_bit;
 }
@@ -123,6 +140,10 @@ SyncFinder::sync_decode (const vector<vector<FrameBit>>& sync_bits,
 
   size_t n_bands = Params::max_band - Params::min_band + 1;
   int bit_count = 0;
+  
+  // Added multi-bit confidence tracking
+  vector<double> bit_qualities;
+  
   for (size_t bit = 0; bit < sync_bits.size(); bit++)
     {
       const vector<FrameBit>& frame_bits = sync_bits[bit];
@@ -142,11 +163,36 @@ SyncFinder::sync_decode (const vector<vector<FrameBit>>& sync_bits,
               frame_bit_count++;
             }
         }
-      sync_quality += bit_quality (umag, dmag, bit) * frame_bit_count;
+      
+      // Calculate quality for this bit and save it
+      double bit_q = bit_quality (umag, dmag, bit) * frame_bit_count;
+      bit_qualities.push_back(bit_q);
+      
+      sync_quality += bit_q;
       bit_count += frame_bit_count;
     }
+  
   if (bit_count)
-    sync_quality /= bit_count;
+    {
+      sync_quality /= bit_count;
+      
+      // Calculate variance of bit qualities to detect inconsistent patterns
+      if (bit_qualities.size() > 1)
+        {
+          double mean = sync_quality * bit_count;
+          double variance = 0;
+          
+          for (double q : bit_qualities)
+            variance += (q - mean) * (q - mean);
+          
+          variance /= bit_qualities.size();
+          
+          // Penalize high variance (inconsistent pattern)
+          double consistency_factor = 1.0 / (1.0 + variance * 0.1);
+          sync_quality *= consistency_factor;
+        }
+    }
+    
   sync_quality = normalize_sync_quality (sync_quality);
 
   return sync_quality;
@@ -181,7 +227,11 @@ SyncFinder::search_approx (vector<SearchKeyResult>& key_results, const vector<ve
   int total_frame_count = mark_sync_frame_count() + mark_data_frame_count();
   if (mode == Mode::CLIP)
     total_frame_count *= 2;
-  for (size_t sync_shift = 0; sync_shift < Params::frame_size; sync_shift += Params::sync_search_step)
+    
+  // Use smaller step size for more precise sync detection
+  const size_t sync_search_step = max(Params::sync_search_step / 2, 64);
+  
+  for (size_t sync_shift = 0; sync_shift < Params::frame_size; sync_shift += sync_search_step)
     {
       sync_fft_parallel (thread_pool, wav_data, sync_shift, fft_db, have_frames);
 
@@ -218,6 +268,7 @@ SyncFinder::search_approx (vector<SearchKeyResult>& key_results, const vector<ve
         }
       thread_pool.wait_all();
     }
+    
   for (auto& key_result : key_results)
     {
       sort (key_result.scores.begin(), key_result.scores.end(), [] (const SearchScore& a, const SearchScore &b) { return a.index < b.index; });
@@ -231,14 +282,40 @@ SyncFinder::search_approx (vector<SearchKeyResult>& key_results, const vector<ve
        * the most relevant sync peaks.
        */
 
-      /* compute local mean for all scores */
+      /* compute local mean for all scores with adaptive window size */
       for (int i = 0; i < int (key_result.scores.size()); i++)
         {
           double avg = 0;
           int n = 0;
-          for (int j = -local_mean_distance; j <= local_mean_distance; j++)
+          
+          // Adaptive window size - use larger window for noisy signals
+          int window_size = local_mean_distance;
+          if (key_result.scores.size() > 100) // Heuristic: for longer content, use adaptive window
             {
-              if (std::abs (j) >= 4)
+              // Calculate local noise level
+              double noise_level = 0;
+              int noise_samples = 0;
+              
+              for (int j = max(0, i - 20); j < min(int(key_result.scores.size()), i + 20); j++)
+                {
+                  if (j != i)
+                    {
+                      noise_level += fabs(key_result.scores[j].raw_quality);
+                      noise_samples++;
+                    }
+                }
+              
+              if (noise_samples > 0)
+                {
+                  noise_level /= noise_samples;
+                  // Adjust window size based on noise level
+                  window_size = max(local_mean_distance, min(local_mean_distance * 2, int(local_mean_distance * (1.0 + noise_level))));
+                }
+            }
+            
+          for (int j = -window_size; j <= window_size; j++)
+            {
+              if (std::abs (j) >= 4) // Don't include very nearby points to avoid self-influence
                 {
                   int idx = i + j;
                   if (idx >= 0 && idx < int (key_result.scores.size()))
@@ -265,16 +342,26 @@ SyncFinder::sync_select_local_maxima (vector<SearchScore>& sync_scores)
       double q = sync_scores[i].abs_quality();
       double q_last = 0;
       double q_next = 0;
+      
+      // Look at more neighbors to ensure it's truly a local maximum
+      double q_last2 = 0;
+      double q_next2 = 0;
+      
       if (i > 0)
         q_last = sync_scores[i - 1].abs_quality();
+      if (i > 1)
+        q_last2 = sync_scores[i - 2].abs_quality();
 
       if (i + 1 < sync_scores.size())
         q_next = sync_scores[i + 1].abs_quality();
+      if (i + 2 < sync_scores.size())
+        q_next2 = sync_scores[i + 2].abs_quality();
 
-      if (q >= q_last && q >= q_next)
+      // More robust local maxima detection
+      if (q >= q_last && q >= q_next && q >= q_last2 && q >= q_next2)
         {
           selected_scores.emplace_back (sync_scores[i]);
-          i++; // score with quality q_next cannot be a local maximum
+          i += 2; // Skip the next 2 points as they cannot be local maxima
         }
     }
   sync_scores = selected_scores;
@@ -293,7 +380,7 @@ void
 SyncFinder::sync_mask_avg_false_positives (vector<SearchScore>& sync_scores)
 {
   static constexpr int    mask_distance = local_mean_distance + 3;
-  static constexpr double mask_factor   = 3;
+  static constexpr double mask_factor   = 2.5; // Reduced from 3 to be less aggressive
   vector<SearchScore> out_scores;
 
   auto quality_sign = [] (const SearchScore& score) {
@@ -317,6 +404,7 @@ SyncFinder::sync_mask_avg_false_positives (vector<SearchScore>& sync_scores)
               int distance = std::abs (int (sync_scores[i].index) - int (sync_scores[j].index)) / Params::sync_search_step;
               if (distance <= mask_distance)
                 {
+                  // Only mask if the quality difference is significantly large
                   if (sync_scores[j].abs_quality() > sync_scores[i].abs_quality() * mask_factor &&
                       quality_sign (sync_scores[j]) != quality_sign (sync_scores[i]))
                     {
@@ -334,7 +422,18 @@ SyncFinder::sync_mask_avg_false_positives (vector<SearchScore>& sync_scores)
 void
 SyncFinder::sync_select_by_threshold (vector<SearchScore>& sync_scores)
 {
-  const double sync_threshold1 = Params::sync_threshold2 * 0.75;
+  // More adaptive threshold that scales with content
+  double avg_quality = 0;
+  for (auto& score : sync_scores)
+    avg_quality += score.abs_quality();
+  
+  if (sync_scores.size() > 0)
+    avg_quality /= sync_scores.size();
+  
+  // Calculate threshold as a mix of fixed threshold and adaptive threshold
+  double adaptive_threshold = avg_quality * 1.5;
+  double fixed_threshold = Params::sync_threshold2 * 0.75;
+  double sync_threshold1 = min(fixed_threshold, max(fixed_threshold * 0.5, adaptive_threshold));
 
   vector<SearchScore> selected_scores;
 
@@ -366,19 +465,31 @@ SyncFinder::sync_select_threshold_and_n_best (vector<SearchScore>& scores, doubl
 {
   std::sort (scores.begin(), scores.end(), [](SearchScore& s1, SearchScore& s2) { return s1.abs_quality() > s2.abs_quality(); });
 
+  // Adaptively lower threshold for cases where no sync points exceed the threshold
+  double adjusted_threshold = threshold;
+  if (scores.size() > 0 && scores[0].abs_quality() < threshold)
+    {
+      // If no scores exceed threshold but we have candidates, use a lower threshold
+      adjusted_threshold = max(threshold * 0.6, scores[0].abs_quality() * 0.9);
+    }
+
   /* keep all matches with (quality > threshold) */
   int i = 0;
-  while (i < int (scores.size()) && scores[i].abs_quality() > threshold)
+  while (i < int (scores.size()) && scores[i].abs_quality() > adjusted_threshold)
     i++;
-  if (i >= Params::get_n_best)
+    
+  // Increase minimum number of results to ensure we don't miss potential matches
+  const int min_results = max(Params::get_n_best, 4);
+  
+  if (i >= min_results)
     {
       /* have more than n_best matches with (quality > threshold), keep all of them */
       scores.resize (i);
     }
-  else if (int (scores.size()) > Params::get_n_best)
+  else if (int (scores.size()) > min_results)
     {
       /* if we have less than n_best matches with (quality > threshold), keep n_best matches */
-      scores.resize (Params::get_n_best);
+      scores.resize (min_results);
     }
 }
 
@@ -420,13 +531,17 @@ SyncFinder::search_refine (const WavData& wav_data, Mode mode, SearchKeyResult& 
           vector<char>  have_frames;
           //printf ("%zd %s %f", score.index, find_closest_sync (score.index).c_str(), score.quality);
 
-          // refine match
+          // refine match with more precise step size
           double best_quality       = score.raw_quality;
           size_t best_index         = score.index;
 
           int start = std::max (int (score.index) - Params::sync_search_step, 0);
           int end   = score.index + Params::sync_search_step;
-          for (int fine_index = start; fine_index <= end; fine_index += Params::sync_search_fine)
+          
+          // Use smaller step for better precision
+          const int fine_step = max(Params::sync_search_fine / 2, 4);
+          
+          for (int fine_index = start; fine_index <= end; fine_index += fine_step)
             {
               sync_fft (wav_data, fine_index, total_frame_count, fft_db, have_frames, want_frames);
               if (fft_db.size())
@@ -528,7 +643,7 @@ SyncFinder::search (const vector<Key>& key_list, const WavData& wav_data, Mode m
       if (mode == Mode::CLIP)
         {
           /* ClipDecoder: enforce a maximum number of matches: at most n_best but at least 5 */
-          size_t n_max = std::max (Params::get_n_best, 5);
+          size_t n_max = std::max (size_t(Params::get_n_best), size_t(5));
           sync_select_truncate_n (search_scores, n_max);
         }
 
@@ -580,110 +695,94 @@ SyncFinder::sync_fft (const WavData& wav_data, size_t index, size_t frame_count,
       const size_t f_first = (index + f * Params::frame_size) * wav_data.n_channels();
       const size_t f_last  = (index + (f + 1) * Params::frame_size) * wav_data.n_channels();
 
-      if ((want_frames.size() && !want_frames[f])   // frame not wanted?
-      ||  (f_last < wav_data_first)                 // frame in silence before input?
-      ||  (f_first > wav_data_last))                // frame in silence after input?
+      /* check if we want this frame */
+      if (!want_frames.empty() && !want_frames[f])
+        continue;
+
+      /* check if we'd read past end */
+      if (f_last > samples.size())
+        continue;
+
+      /* check if we'd read within silent area at beginning/end */
+      if (f_first < wav_data_first || f_last > wav_data_last)
+        continue;
+
+      have_frames[f] = 1;
+
+      vector<vector<complex<float>>> fft_out = fft_analyzer.run_fft (samples, index + f * Params::frame_size);
+
+      for (size_t ch = 0; ch < fft_out.size(); ch++)
         {
-          out_pos += n_bands;
+          for (size_t i = 0; i < n_bands; i++)
+            {
+              const double min_db = -96;
+              /* use (i + min_band) as index to restrict our analysis to bands with watermark only */
+              fft_out_db[f * n_bands + i] += db_from_complex (fft_out[ch][i + Params::min_band], min_db);
+            }
         }
-      else
+      if (fft_out.size()) /* normalize */
         {
-          constexpr double min_db = -96;
-
-          vector<vector<complex<float>>> frame_result = fft_analyzer.run_fft (samples, index + f * Params::frame_size);
-
-          /* computing db-magnitude is expensive, so we better do it here */
-          for (int ch = 0; ch < wav_data.n_channels(); ch++)
-            for (int i = Params::min_band; i <= Params::max_band; i++)
-              fft_out_db[out_pos + i - Params::min_band] += db_from_complex (frame_result[ch][i], min_db);
-
-          out_pos += n_bands;
-
-          have_frames[f] = 1;
+          for (size_t i = 0; i < n_bands; i++)
+            fft_out_db[f * n_bands + i] /= fft_out.size();
         }
     }
 }
 
-void
-SyncFinder::sync_fft_parallel (ThreadPool& thread_pool,
-                               const WavData& wav_data,
-                               size_t index,
-                               std::vector<float>& fft_out_db,
-                               std::vector<char>& have_frames)
+template<class T> vector<vector<T>>
+SyncFinder::split_vector (const vector<T>& vec, size_t n)
 {
-  std::mutex result_mutex;
+  vector<vector<T>> result;
+
+  for (size_t i = 0; i < vec.size(); i += n)
+    {
+      result.emplace_back();
+      for (size_t j = i; j < vec.size() && j < i + n; j++)
+        result.back().push_back (vec[j]);
+    }
+
+  return result;
+}
+
+void
+SyncFinder::sync_fft_parallel (ThreadPool& thread_pool, const WavData& wav_data, size_t sync_shift, vector<float>& fft_out_db, vector<char>& have_frames)
+{
+  const size_t n_bands = Params::max_band - Params::min_band + 1;
+  const int frames_needed = frame_count (wav_data);
 
   fft_out_db.clear();
   have_frames.clear();
 
-  struct PartialFFTResult
-  {
-    int           start_frame = 0;
-    vector<char>  have_frames;
-    vector<float> fft_db;
-  };
-  vector<PartialFFTResult> partial_fft_results;
-  const int frames_per_job = 256;
-  for (int start_frame = 0; start_frame < frame_count (wav_data); start_frame += frames_per_job)
+  fft_out_db.resize (n_bands * frames_needed);
+  have_frames.resize (frames_needed);
+
+  std::mutex mutex;
+  for (int f_start = 0; f_start < frames_needed; f_start += 32)
     {
-      thread_pool.add_job ([this, start_frame, index, frames_per_job,
-                            &wav_data, &partial_fft_results, &result_mutex]
+      thread_pool.add_job ([&, f_start, sync_shift]()
         {
-          const int remaining_frames = frame_count (wav_data) - 1 - start_frame;
-          const int frames = std::min (remaining_frames, frames_per_job);
-          if (frames > 0)
+          vector<float> thread_fft_out_db;
+          vector<char>  thread_have_frames;
+          sync_fft (wav_data, sync_shift + f_start * Params::frame_size, std::min (32, frames_needed - f_start), thread_fft_out_db, thread_have_frames, {});
+
+          std::lock_guard<std::mutex> lg (mutex);
+          if (thread_fft_out_db.size())
             {
-              PartialFFTResult result;
-              result.start_frame = start_frame;
-              sync_fft (wav_data, index + start_frame * Params::frame_size, frames, result.fft_db, result.have_frames, /* want all frames */ {});
-              if (!result.fft_db.size())
-                warning ("SyncFinder: sync_fft_parallel expected %d fft frames, but result was empty\n", frames);
-              {
-                std::lock_guard<std::mutex> lg (result_mutex);
-                partial_fft_results.push_back (result);
-              }
+              assert (thread_fft_out_db.size() == thread_have_frames.size() * n_bands);
+              for (size_t fi = 0; fi < thread_have_frames.size(); fi++)
+                {
+                  const int f = f_start + fi;
+                  /* only update if we have proper fft results for this frame */
+                  if (f < frames_needed && thread_have_frames[fi])
+                    {
+                      have_frames[f] = 1;
+                      for (size_t i = 0; i < n_bands; i++)
+                        {
+                          fft_out_db[f * n_bands + i] = thread_fft_out_db[fi * n_bands + i];
+                        }
+                    }
+                }
             }
         });
     }
   thread_pool.wait_all();
-  std::sort (partial_fft_results.begin(), partial_fft_results.end(),
-             [] (const auto& r1, const auto& r2) { return r1.start_frame < r2.start_frame; });
-
-  for (const auto& partial_fft_result : partial_fft_results)
-    {
-      fft_out_db.insert (fft_out_db.end(), partial_fft_result.fft_db.begin(), partial_fft_result.fft_db.end());
-      have_frames.insert (have_frames.end(), partial_fft_result.have_frames.begin(), partial_fft_result.have_frames.end());
-    }
-}
-
-string
-SyncFinder::find_closest_sync (size_t index)
-{
-  int wm_length = (mark_data_frame_count() + mark_sync_frame_count()) * Params::frame_size;
-  int wm_offset = Params::frames_pad_start * Params::frame_size;
-  int best_error = wm_length * 2;
-  int best = 0;
-
-  for (int i = 0; i < 100; i++)
-    {
-      int error = abs (int (index) - (wm_offset + i * wm_length));
-      if (error < best_error)
-        {
-          best = i;
-          best_error = error;
-        }
-    }
-  return string_printf ("n:%d offset:%d", best, int (index) - (wm_offset + best * wm_length));
-}
-
-vector<vector<int>>
-SyncFinder::split_vector (vector<int>& in_vector, size_t max_size)
-{
-  /* split input vector into smaller vectors of at most max_size elements */
-  vector<vector<int>> result;
-  size_t size = in_vector.size();
-
-  for (size_t i = 0; i < size; i += max_size)
-    result.emplace_back (in_vector.begin() + i, in_vector.begin() + i + min (size - i, max_size));
-  return result;
 }

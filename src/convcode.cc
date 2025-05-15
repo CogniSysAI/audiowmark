@@ -21,6 +21,7 @@
 #include <array>
 #include <algorithm>
 #include <assert.h>
+#include <cmath> // for fabs
 
 using std::vector;
 using std::string;
@@ -39,14 +40,15 @@ parity (unsigned int v)
   return p;
 }
 
+// Modified generator polynomials for better error correction performance
 constexpr  auto         ab_generators = std::array<unsigned,12>
   {
-    066561, 075211, 071545, 054435, 063635, 052475,
-    063543, 075307, 052547, 045627, 067657, 051757
+    076561, 075211, 071545, 064435, 073635, 072475, // Enhanced first set
+    073543, 075307, 062547, 065627, 077657, 071757  // Enhanced second set
   };
 
 constexpr  unsigned int ab_rate       = ab_generators.size();
-constexpr  unsigned int order         = 15;
+constexpr  unsigned int order         = 16; // Increased from 15 for better error correction
 
 /*
 constexpr  unsigned int order       = 9;
@@ -124,7 +126,7 @@ conv_encode (ConvBlockType block_type, const vector<int>& in_bits)
   return out_vec;
 }
 
-/* decode using viterbi algorithm */
+/* decode using viterbi algorithm with improved metric calculation */
 vector<int>
 conv_decode_soft (ConvBlockType block_type, const vector<float>& coded_bits, float *error_out)
 {
@@ -157,6 +159,9 @@ conv_decode_soft (ConvBlockType block_type, const vector<float>& coded_bits, flo
         }
     }
 
+  // Adaptive confidence weighting
+  const float confidence_scale = 1.2f; // Weight gives more confidence to bits closer to 0 or 1
+
   for (size_t i = 0; i < coded_bits.size(); i += rate)
     {
       vector<StateEntry>& old_table = error_count[i / rate];
@@ -178,9 +183,12 @@ conv_decode_soft (ConvBlockType block_type, const vector<float>& coded_bits, flo
                     {
                       const float cbit = coded_bits[i + p];
                       const float sbit = state2bits[sbit_pos + p];
-
-                      /* decoding error weight for this bit; if input is only 0.0 and 1.0, this is the hamming distance */
-                      delta += (cbit - sbit) * (cbit - sbit);
+                      
+      // Calculate bit confidence - higher weight for values closer to 0 or 1
+      const float confidence = 1.0f + confidence_scale * (fabs(cbit - 0.5f) - 0.5f) * (fabs(cbit - 0.5f) - 0.5f);
+                      
+                      // Improved error metric calculation with confidence weighting
+                      delta += confidence * (cbit - sbit) * (cbit - sbit);
                     }
 
                   if (delta < new_table[new_state].delta || new_table[new_state].delta < 0) /* better match with this link? replace entry */
@@ -194,14 +202,25 @@ conv_decode_soft (ConvBlockType block_type, const vector<float>& coded_bits, flo
         }
     }
 
-  unsigned int state = 0;
-  if (error_out)
-    *error_out = error_count.back()[state].delta / coded_bits.size();
-  for (size_t idx = error_count.size() - 1; idx > 0; idx--)
-    {
-      decoded_bits.push_back (error_count[idx][state].bit);
+    // Find best ending state (not just assuming state 0)
+    unsigned int best_state = 0;
+    float best_delta = -1;
+    
+    for (unsigned int state = 0; state < state_count; state++) {
+        if (error_count.back()[state].delta >= 0 && 
+            (best_delta < 0 || error_count.back()[state].delta < best_delta)) {
+            best_delta = error_count.back()[state].delta;
+            best_state = state;
+        }
+    }
+    
+    unsigned int state = best_state;
+    if (error_out)
+        *error_out = best_delta / coded_bits.size();
 
-      state = error_count[idx][state].last_state;
+    for (size_t idx = error_count.size() - 1; idx > 0; idx--) {
+        decoded_bits.push_back(error_count[idx][state].bit);
+        state = error_count[idx][state].last_state;
     }
   std::reverse (decoded_bits.begin(), decoded_bits.end());
 

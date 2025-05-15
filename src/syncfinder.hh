@@ -136,7 +136,9 @@ private:
                  std::vector<char>& have_frames,
                  const std::vector<char>& want_frames);
   std::string find_closest_sync (size_t index);
-  std::vector<std::vector<int>> split_vector (std::vector<int>& in_vector, size_t max_size);
+  
+  template<class T>
+  std::vector<std::vector<T>> split_vector (const std::vector<T>& vec, size_t n);
 };
 
 #endif

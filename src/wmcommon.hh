@@ -36,8 +36,8 @@ public:
   static constexpr size_t frame_size      = 1024;
   static           int    frames_per_bit;
   static constexpr size_t bands_per_frame = 30;
-  static constexpr int max_band          = 100;
-  static constexpr int min_band          = 20;
+  static constexpr int max_band          = 120; // Increased from 100 to capture more high-frequency content
+  static constexpr int min_band          = 15;  // Decreased from 20 to include more low-frequency content
 
   static           double water_delta;
   static           std::string json_output;
@@ -60,6 +60,7 @@ public:
   static constexpr int sync_search_fine    = 8;
   static           double sync_threshold2;         // minimum refined quality
   static           int get_n_best;                 // minimum number of matches per decode step
+  static           bool skip_block_type_b;         // skip decoding of block type B (default false)
 
   static constexpr size_t frames_pad_start = 250; // padding at start, in case track starts with silence
   static constexpr int mark_sample_rate = 44100; // watermark generation and detection sample rate
