@@ -878,6 +878,10 @@ parse_get_options (ArgParser& ap)
         }
       Params::get_n_best = i;
     }
+  if (ap.parse_opt ("--skip-block-type-b"))
+    {
+      Params::skip_block_type_b = true;
+    }
 }
 
 template <class ... Args>

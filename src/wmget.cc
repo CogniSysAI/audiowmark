@@ -269,6 +269,12 @@ public:
         return 99; // should not happen
       };
 
+      // If we're skipping block type B, prioritize patterns with block type A
+      if (Params::skip_block_type_b && 
+          ab(p1) != ab(p2) && 
+          (ab(p1) == 0 || ab(p2) == 0)) // at least one is type A
+        return ab(p1) == 0; // Return true if p1 is type A
+
       if (p1.key.name() != p2.key.name())
         return p1.key.name() < p2.key.name();
       else if (p1.rating != p2.rating)
