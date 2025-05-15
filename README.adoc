@@ -1,5 +1,9 @@
 = audiowmark - Audio Watermarking
 
+== About This Fork
+
+This repository is a fork of the original https://github.com/swesterfeld/audiowmark[audiowmark] project. We've made several enhancements and modifications to better support our specific use case, particularly around watermark robustness and retrieval performance. These changes improve the tool's effectiveness in adversarial environments and support integration with our broader audio protection workflow.
+
 == Description
 
 `audiowmark` is an Open Source (GPL) solution for audio watermarking.
